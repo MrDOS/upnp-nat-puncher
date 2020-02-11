@@ -1,0 +1,56 @@
+#! /usr/bin/env python3
+
+from collections import namedtuple
+import subprocess
+import sys
+import time
+
+NatLayer = namedtuple('NatLayer', ('upnp_root_url', 'local_ip'))
+ForwardingRule = namedtuple('Forward', ('name', 'protocol', 'ports'))
+
+NAME_PREFIX = 'Sam - '
+RULE_TIMEOUT = 12 * 60 * 60 # 12 hours in seconds
+
+NAT_LAYERS = (NatLayer('http://192.168.0.1:1900/gatedesc.xml', '192.168.0.10'),
+              NatLayer('http://192.168.1.254:60757/8fe0395d/rootDesc.xml', '192.168.1.2'))
+FORWARDING_RULES = (ForwardingRule('SSH', 'TCP', (22, 22, 28022)),
+                    ForwardingRule('HTTP', 'TCP', (80, 80, 28080)),
+                    ForwardingRule('HTTPS', 'TCP', (443, 443, 28443)),
+                    ForwardingRule('Control', 'TCP', (58846, 58846, 58846)),
+                    ForwardingRule('Data', 'TCP', ('6881', '56881', '56881')))
+
+def sanity_check_config():
+    expected_forward_ports_length = len(NAT_LAYERS) + 1
+    for forward in FORWARDING_RULES:
+        if len(forward.ports) != expected_forward_ports_length:
+            raise Exception(f'Expected forwarding rule "{forward.name}" to '
+                           + f'have {expected_forward_ports_length} port '
+                           + f'definitions, but it only has '
+                           + f'{len(forward.ports)}!')
+
+def configure_forwarding_rules():
+    for i, layer in enumerate(NAT_LAYERS):
+        for rule in FORWARDING_RULES:
+            subprocess.run(('upnpc',
+                            '-u',
+                            layer.upnp_root_url,
+                            '-e',
+                            f'{NAME_PREFIX}{rule.name} ',
+                            '-a',
+                            layer.local_ip,
+                            str(rule.ports[i]),
+                            str(rule.ports[i + 1]),
+                            rule.protocol,
+                            str(RULE_TIMEOUT)),
+                           stdout=sys.stdout, stderr=sys.stderr)
+
+def main(args):
+    sanity_check_config()
+    configure_forwarding_rules()
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv))
+    except Exception as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)

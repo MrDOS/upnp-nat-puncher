@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically Configure UPnP Forwarding Rules
+
+[Timer]
+OnBootSec=0
+OnUnitActiveSec=1800
+
+[Install]
+WantedBy=default.target
