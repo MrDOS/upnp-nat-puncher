@@ -1,23 +1,109 @@
 #! /usr/bin/env python3
 
-from collections import namedtuple
+from bs4 import BeautifulSoup
+import os.path
+import socket
 import subprocess
 import sys
 import time
-
-NatLayer = namedtuple('NatLayer', ('upnp_root_url', 'local_ip'))
-ForwardingRule = namedtuple('Forward', ('name', 'protocol', 'ports'))
+from typing import NamedTuple
+import urllib.parse
 
 NAME_PREFIX = 'Sam - '
 RULE_TIMEOUT = 12 * 60 * 60 # 12 hours in seconds
 
-NAT_LAYERS = (NatLayer('http://192.168.0.1:1900/gatedesc.xml', '192.168.0.10'),
-              NatLayer('http://192.168.1.254:60757/8fe0395d/rootDesc.xml', '192.168.1.2'))
+PORT_AUTO_CACHE = '/etc/upnp-nat-puncher/'
+
+class NatLayer(NamedTuple):
+    name: str
+    upnp_root_url: str
+    local_ip: str
+
+    def discover_root_port(self):
+        """
+        Performs port discovery for the given UPnP root URL, if necessary.
+        Returns a UPnP root URL with a usable port.
+        """
+        url = urllib.parse.urlparse(self.upnp_root_url)
+        # Can't use ParseResult.port because it tries to int()ify the value.
+        ports = url._hostinfo[-1]
+
+        if '-' not in ports:
+            return self.upnp_root_url
+
+        filename = os.path.join(PORT_AUTO_CACHE, f'{self.name}.xml')
+        sock_addr = NatLayer._check_addresses_from_nmap_output(filename)
+        # No cached port, or it was no longer valid.
+        if not sock_addr:
+            print(f'Discovering connection port for {url.hostname}...')
+            subprocess.run(('nmap',
+                            '-oX',
+                            filename,
+                            '-sS',
+                            '-p',
+                            ports,
+                            url.hostname),
+                           stdout=sys.stdout, stderr=sys.stderr)
+            sock_addr = NatLayer._check_addresses_from_nmap_output(filename)
+            print(f'Using new address {sock_addr}.')
+        else:
+            print(f'Using cached address {sock_addr}.')
+
+        if not sock_addr:
+            # nmap gave us squat.
+            return None
+
+        return urllib.parse.urlunparse((url.scheme,
+                                        f'{sock_addr[0]}:{sock_addr[1]}',
+                                        url.path,
+                                        url.params,
+                                        url.query,
+                                        url.fragment))
+
+    def _check_addresses_from_nmap_output(filename):
+        sock_addrs = NatLayer._load_addresses_from_nmap_output(filename)
+
+        for sock_addr in sock_addrs:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            try:
+                sock.connect(sock_addr)
+                return sock_addr
+            except:
+                pass
+            finally:
+                sock.close()
+
+        return None
+
+    def _load_addresses_from_nmap_output(filename):
+        try:
+            with open(filename, 'r') as nmap_file:
+                nmap = nmap_file.read()
+        except:
+            return []
+
+        nmap_soup = BeautifulSoup(nmap, 'xml')
+        sock_addrs = []
+        for host in nmap_soup.findAll('host'):
+            address = host.find('address')['addr']
+
+            for port in host.findAll('port'):
+                sock_addrs.append((address, int(port['portid'])))
+        return sock_addrs
+
+class ForwardingRule(NamedTuple):
+    name: str
+    protocol: str
+    ports: any
+
+NAT_LAYERS = (NatLayer('Shed', 'http://192.168.0.1:1900/gatedesc.xml', '192.168.0.10'),
+              NatLayer('House', 'http://192.168.1.254:50000-65535/8fe0395d/rootDesc.xml', '192.168.1.2'))
 FORWARDING_RULES = (ForwardingRule('SSH', 'TCP', (22, 22, 28022)),
-                    ForwardingRule('HTTP', 'TCP', (80, 80, 28080)),
-                    ForwardingRule('HTTPS', 'TCP', (443, 443, 28443)),
-                    ForwardingRule('Control', 'TCP', (58846, 58846, 58846)),
-                    ForwardingRule('Data', 'TCP', ('6881', '56881', '56881')))
+                    ForwardingRule('HTTP', 'TCP', (80,) * 3),
+                    ForwardingRule('HTTPS', 'TCP', (443,) * 3),
+                    ForwardingRule('Control', 'TCP', (58846,) * 3),
+                    ForwardingRule('Data', 'TCP', ('56881',) * 3))
 
 def sanity_check_config():
     expected_forward_ports_length = len(NAT_LAYERS) + 1
@@ -30,10 +116,15 @@ def sanity_check_config():
 
 def configure_forwarding_rules():
     for i, layer in enumerate(NAT_LAYERS):
+        upnp_root_url = layer.discover_root_port()
+
+        if not upnp_root_url:
+            continue
+
         for rule in FORWARDING_RULES:
             subprocess.run(('upnpc',
                             '-u',
-                            layer.upnp_root_url,
+                            upnp_root_url,
                             '-e',
                             f'{NAME_PREFIX}{rule.name} ',
                             '-a',
